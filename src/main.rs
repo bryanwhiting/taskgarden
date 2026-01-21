@@ -160,6 +160,27 @@ enum Commands {
         #[arg(short = 'p', long)]
         priority: Option<String>,
     },
+    /// Summarize tasks with flexible slicing and grouping
+    Summary {
+        /// Group by: date, priority, project, status, context, created (default: date)
+        #[arg(short, long, default_value = "date")]
+        group: String,
+        /// Show tasks created in the last N days
+        #[arg(long)]
+        created_days: Option<i64>,
+        /// Show tasks due in the next N days
+        #[arg(long)]
+        due_days: Option<i64>,
+        /// Include completed tasks
+        #[arg(long)]
+        include_done: bool,
+        /// Sort groups by: count, time, name (default: name)
+        #[arg(short, long, default_value = "name")]
+        sort: String,
+        /// Show detailed task list for each group
+        #[arg(short, long)]
+        detailed: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -2988,6 +3009,202 @@ fn cmd_merge(config: &Config, threshold: f64, reset: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_summary(_config: &Config, group_by: &str, created_days: Option<i64>, due_days: Option<i64>, include_done: bool, sort_by: &str, detailed: bool) -> Result<()> {
+    use std::collections::HashMap;
+    
+    println!("{}", format!("📊 Task Summary - Grouped by {}\n", group_by).cyan().bold());
+    
+    let tasks = get_tasks_from_cache()?;
+    let today = Local::now().date_naive();
+    
+    // Filter tasks based on parameters
+    let filtered_tasks: Vec<Task> = tasks.into_iter().filter(|task| {
+        // Exclude done tasks unless requested
+        if !include_done && task.priority.as_ref().map(|p| p == "DONE").unwrap_or(false) {
+            return false;
+        }
+        
+        // Filter by creation date if specified
+        if let Some(_days) = created_days {
+            // For now, we'll skip this filter as we'd need to add created_date tracking
+            // This would require schema changes
+        }
+        
+        // Filter by due date if specified
+        if let Some(days) = due_days {
+            if let Ok(task_date) = chrono::NaiveDate::parse_from_str(&task.date, "%Y-%m-%d") {
+                let days_until = (task_date - today).num_days();
+                if days_until > days {
+                    return false;
+                }
+            }
+        }
+        
+        true
+    }).collect();
+    
+    // Group tasks based on the grouping parameter
+    let mut groups: HashMap<String, Vec<Task>> = HashMap::new();
+    
+    for task in filtered_tasks {
+        let group_key = match group_by {
+            "date" | "due" => task.date.clone(),
+            "priority" => task.priority.clone().unwrap_or_else(|| "--".to_string()),
+            "project" => task.project.clone().unwrap_or_else(|| "No Project".to_string()),
+            "status" => task.status.clone().unwrap_or_else(|| "todo".to_string()),
+            "context" => task.context.clone().unwrap_or_else(|| "No Context".to_string()),
+            "created" => {
+                // For now, use date as proxy (would need schema changes for real created date)
+                task.date.clone()
+            }
+            _ => "Unknown".to_string(),
+        };
+        
+        groups.entry(group_key).or_insert_with(Vec::new).push(task);
+    }
+    
+    // Calculate time estimates and counts for each group
+    struct GroupStats {
+        name: String,
+        count: usize,
+        total_minutes: i32,
+    }
+    
+    let mut group_stats: Vec<GroupStats> = groups.iter().map(|(name, tasks)| {
+        let total_minutes = tasks.iter().map(|t| t.time.as_ref().map(|time| parse_time_to_minutes(time)).unwrap_or(0)).sum();
+        GroupStats {
+            name: name.clone(),
+            count: tasks.len(),
+            total_minutes,
+        }
+    }).collect();
+    
+    // Sort groups based on sort parameter
+    match sort_by {
+        "count" => group_stats.sort_by(|a, b| b.count.cmp(&a.count)),
+        "time" => group_stats.sort_by(|a, b| b.total_minutes.cmp(&a.total_minutes)),
+        _ => {
+            // Sort by name, handling dates specially
+            if group_by == "date" || group_by == "due" {
+                group_stats.sort_by(|a, b| a.name.cmp(&b.name));
+            } else {
+                group_stats.sort_by(|a, b| {
+                    // Special sorting for priorities
+                    if group_by == "priority" {
+                        let priority_order = ["P0", "P1", "P2", "P3", "--", "DONE"];
+                        let a_idx = priority_order.iter().position(|&p| p == a.name).unwrap_or(999);
+                        let b_idx = priority_order.iter().position(|&p| p == b.name).unwrap_or(999);
+                        a_idx.cmp(&b_idx)
+                    } else {
+                        a.name.cmp(&b.name)
+                    }
+                });
+            }
+        }
+    }
+    
+    // Display results
+    let total_tasks: usize = group_stats.iter().map(|g| g.count).sum();
+    let total_minutes: i32 = group_stats.iter().map(|g| g.total_minutes).sum();
+    
+    for stats in &group_stats {
+        let time_str = format_time_from_minutes(stats.total_minutes);
+        
+        // Format the group name nicely for dates
+        let display_name = if group_by == "date" || group_by == "due" {
+            if let Ok(date) = chrono::NaiveDate::parse_from_str(&stats.name, "%Y-%m-%d") {
+                let days_diff = (date - today).num_days();
+                let day_str = match days_diff {
+                    0 => " (today)".cyan().to_string(),
+                    1 => " (tomorrow)".yellow().to_string(),
+                    -1 => " (yesterday)".red().to_string(),
+                    d if d < 0 => format!(" ({} days ago)", -d).red().to_string(),
+                    d => format!(" (in {} days)", d).green().to_string(),
+                };
+                format!("{}{}", date.format("%a %b %d"), day_str)
+            } else {
+                stats.name.clone()
+            }
+        } else {
+            stats.name.clone()
+        };
+        
+        println!("🏷️  {} {}", display_name.bold(), format!("({} tasks, {})", stats.count, time_str).dimmed());
+        
+        if detailed {
+            if let Some(tasks) = groups.get(&stats.name) {
+                for task in tasks {
+                    let time_str = task.time.as_ref().map(|t| format!(" {{{}}}", t)).unwrap_or_default();
+                    let status_str = task.status.as_ref().map(|s| format!(" [{}]", s)).unwrap_or_default();
+                    println!("   • {}{}{}", task.title, time_str.dimmed(), status_str.cyan());
+                }
+            }
+            println!();
+        }
+    }
+    
+    // Display totals
+    println!("{}", "─".repeat(50).dimmed());
+    println!("📈 {} Total: {} tasks, {}", 
+        "Summary".bold(), 
+        total_tasks.to_string().green(),
+        format_time_from_minutes(total_minutes).yellow()
+    );
+    
+    // Add insights based on grouping
+    match group_by {
+        "priority" => {
+            if let Some(p0_stats) = group_stats.iter().find(|s| s.name == "P0") {
+                if p0_stats.count > 5 {
+                    println!("\n⚠️  {} You have {} P0 tasks - consider re-prioritizing", "Warning:".red(), p0_stats.count);
+                }
+            }
+        }
+        "date" | "due" => {
+            let overdue_count: usize = group_stats.iter()
+                .filter(|s| {
+                    if let Ok(date) = chrono::NaiveDate::parse_from_str(&s.name, "%Y-%m-%d") {
+                        date < today
+                    } else {
+                        false
+                    }
+                })
+                .map(|s| s.count)
+                .sum();
+                
+            if overdue_count > 0 {
+                println!("\n⚠️  {} You have {} overdue tasks", "Alert:".red(), overdue_count);
+            }
+            
+            let today_stats = group_stats.iter().find(|s| s.name == today.format("%Y-%m-%d").to_string());
+            if let Some(stats) = today_stats {
+                if stats.total_minutes > 480 {
+                    println!("\n⚠️  {} Today has {} of work scheduled (> 8 hours)", 
+                        "Warning:".yellow(), 
+                        format_time_from_minutes(stats.total_minutes)
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+    
+    Ok(())
+}
+
+// Helper function to format minutes to readable time
+fn format_time_from_minutes(minutes: i32) -> String {
+    if minutes == 0 {
+        "no estimate".to_string()
+    } else if minutes < 60 {
+        format!("{}m", minutes)
+    } else if minutes % 60 == 0 {
+        format!("{}h", minutes / 60)
+    } else {
+        format!("{}h {}m", minutes / 60, minutes % 60)
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = load_config()?;
@@ -2999,7 +3216,7 @@ fn main() -> Result<()> {
             sync_with_google(&config.google_account, *force)?;
             update_last_query()?;
         }
-        Commands::Triage { .. } | Commands::Focus | Commands::Plan | Commands::Schedule { .. } | Commands::List { .. } | Commands::Merge { .. } | Commands::Show { .. } | Commands::Search { .. } | Commands::Bump { .. } => {
+        Commands::Triage { .. } | Commands::Focus | Commands::Plan | Commands::Schedule { .. } | Commands::List { .. } | Commands::Merge { .. } | Commands::Show { .. } | Commands::Search { .. } | Commands::Bump { .. } | Commands::Summary { .. } => {
             // Smart sync (check throttle)
             if should_sync(&config, false)? {
                 sync_with_google(&config.google_account, false)?;
@@ -3028,6 +3245,9 @@ fn main() -> Result<()> {
         Commands::Sync { force: _ } => {
             // Already handled above
             println!("{}", "✓ Sync complete!".green());
+        }
+        Commands::Summary { group, created_days, due_days, include_done, sort, detailed } => {
+            cmd_summary(&config, &group, created_days, due_days, include_done, &sort, detailed)?
         }
     }
 
