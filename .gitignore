@@ -1,0 +1,21 @@
+# Rust
+/target
+Cargo.lock
+
+# SQLite
+*.db
+*.db-*
+
+# User config (contains email)
+config.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
