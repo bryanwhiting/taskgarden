@@ -9,6 +9,7 @@ Built with Rust for speed, designed for humans who get overwhelmed by todo lists
 - **Smart Triage** - Three-pass system: prioritize, categorize, estimate time
 - **Instant Save** - Every change saves immediately (never lose progress)
 - **Fast Sync** - Local SQLite cache with smart sync throttling
+- **Team Dashboards** - Push to Airtable or ClickUp for team visibility 🆕
 - **Task Types** - Use hashtags: `#FollowUp`, `#Plan`, `#DeepWork`
 - **Calendar Integration** - See your week with meetings + tasks
 - **Focus Mode** - Show only critical tasks (hide the noise)
@@ -53,6 +54,80 @@ t list --grouped  # Group by date
 # Manual sync
 t sync
 t sync --force    # Full re-sync
+
+# Push to Airtable or ClickUp for team visibility
+t sync --airtable
+t sync --clickup
+```
+
+## Team Dashboards 🆕
+
+Push your triaged tasks to **Airtable** or **ClickUp** for team visibility!
+
+**Flow:** Google Tasks (capture) → TaskGarden (triage) → Airtable/ClickUp (team dashboard)
+
+### Choose Your Platform
+
+<table>
+<tr>
+<th>Airtable</th>
+<th>ClickUp</th>
+</tr>
+<tr>
+<td>
+
+```bash
+# Setup: AIRTABLE_SETUP.md
+t sync --airtable
+```
+
+**Best for:**
+- ✅ Custom databases
+- ✅ Flexible views
+- ✅ Simple setup
+- ✅ Spreadsheet-like
+
+</td>
+<td>
+
+```bash
+# Setup: CLICKUP_SETUP.md
+t sync --clickup
+```
+
+**Best for:**
+- ✅ Full PM features
+- ✅ Subtasks & dependencies
+- ✅ Time tracking
+- ✅ Team collaboration
+
+</td>
+</tr>
+</table>
+
+### Daily Workflow
+
+```bash
+t sync              # Sync with Google Tasks
+t triage            # Prioritize, categorize, estimate
+t sync --clickup    # Push to ClickUp for team
+# OR
+t sync --airtable   # Push to Airtable for team
+# OR both!
+t sync --airtable --clickup
+```
+
+**Benefits:**
+- ✅ Team sees what you're working on
+- ✅ Filter by priority, status, date, assignee
+- ✅ Multiple views (kanban, calendar, timeline)
+- ✅ Mobile access
+- ✅ Comments & collaboration
+
+**📖 Full guides:**
+- [TEAM_DASHBOARDS.md](./TEAM_DASHBOARDS.md) - Overview & comparison
+- [AIRTABLE_SETUP.md](./AIRTABLE_SETUP.md) & [AIRTABLE_USAGE.md](./AIRTABLE_USAGE.md)
+- [CLICKUP_SETUP.md](./CLICKUP_SETUP.md) & [CLICKUP_USAGE.md](./CLICKUP_USAGE.md)
 ```
 
 ## Features

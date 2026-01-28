@@ -1,4 +1,8 @@
 mod sync;
+mod airtable;
+mod airtable_sync;
+mod clickup;
+mod clickup_sync;
 
 use anyhow::{Context, Result};
 use chrono::{Datelike, Local, Utc, TimeZone};
@@ -16,6 +20,10 @@ use std::io::{stdout, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use sync::{SyncManager, CachedTask};
+use airtable::AirtableClient;
+use airtable_sync::AirtableSync;
+use clickup::ClickUpClient;
+use clickup_sync::ClickUpSync;
 
 // Pre-compiled regex for parsing task titles
 // Format: [date][priority][project][status][@context]{time} title
@@ -137,6 +145,12 @@ enum Commands {
     Sync {
         #[arg(short, long)]
         force: bool,
+        /// Push tasks to Airtable for team visibility
+        #[arg(short, long)]
+        airtable: bool,
+        /// Push tasks to ClickUp for team visibility
+        #[arg(short, long)]
+        clickup: bool,
     },
     /// Show details for a specific task
     Show {
@@ -232,6 +246,30 @@ struct Config {
     task_types: std::collections::HashMap<String, TaskTypeDefaults>,
     #[serde(default = "default_sync_throttle")]
     sync_throttle_minutes: i64,
+    #[serde(default)]
+    airtable: Option<AirtableConfig>,
+    #[serde(default)]
+    clickup: Option<ClickUpConfig>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct AirtableConfig {
+    #[serde(default)]
+    enabled: bool,
+    api_key: String,
+    base_id: String,
+    table_name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ClickUpConfig {
+    #[serde(default)]
+    enabled: bool,
+    api_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    list_id: Option<String>,  // Default list for new tasks
+    #[serde(skip_serializing_if = "Option::is_none")]
+    list_mappings: Option<std::collections::HashMap<String, String>>,  // Google list ID -> ClickUp list ID
 }
 
 fn default_sync_throttle() -> i64 {
@@ -533,6 +571,8 @@ fn create_default_config() -> Config {
         contexts: vec!["@work".into(), "@home".into(), "@phone".into(), "@errands".into()],
         task_types,
         sync_throttle_minutes: 10,
+        airtable: None,
+        clickup: None,
     }
 }
 
@@ -667,6 +707,7 @@ fn sync_with_google(account: &str, force: bool) -> Result<()> {
 
                         let cached = CachedTask {
                             id: task_id.to_string(),
+                            unique_id: uuid::Uuid::new_v4().to_string(),
                             list_id: list_id.to_string(),
                             title: title.to_string(),
                             status: status.to_string(),
@@ -674,6 +715,16 @@ fn sync_with_google(account: &str, force: bool) -> Result<()> {
                             created,
                             links,
                             dirty: false, // From remote, not dirty
+                            priority: None,
+                            project: None,
+                            context: None,
+                            duration: None,
+                            due_date: None,
+                            start_date: None,
+                            scheduled_date: None,
+                            tags: None,
+                            user_description: None,
+                            taskgarden_description: String::new(), // Will be regenerated
                         };
 
                         // Use upsert_task_from_remote to skip dirty tasks
@@ -696,6 +747,133 @@ fn sync_with_google(account: &str, force: bool) -> Result<()> {
         println!("{}", format!("✓ Synced {} tasks", synced_count).green());
     }
     
+    Ok(())
+}
+
+fn sync_to_airtable(config: &Config) -> Result<()> {
+    // Check if Airtable is enabled
+    let airtable_config = match &config.airtable {
+        Some(cfg) if cfg.enabled => cfg,
+        Some(_) => {
+            println!("{}", "ℹ️  Airtable sync disabled in config".yellow());
+            return Ok(());
+        }
+        None => {
+            println!("{}", "ℹ️  Airtable not configured. Add 'airtable' section to config.json".yellow());
+            return Ok(());
+        }
+    };
+
+    println!("{}", "📤 Pushing tasks to Airtable...".cyan());
+
+    // Create Airtable client
+    let client = AirtableClient::new(airtable::AirtableConfig {
+        api_key: airtable_config.api_key.clone(),
+        base_id: airtable_config.base_id.clone(),
+        table_name: airtable_config.table_name.clone(),
+    })?;
+
+    // Create sync manager
+    let sync_manager = SyncManager::new()?;
+    let airtable_sync = AirtableSync::new(sync_manager, client);
+
+    // Push to Airtable
+    let stats = airtable_sync.push_to_airtable()?;
+
+    if stats.created > 0 || stats.updated > 0 {
+        println!(
+            "{}",
+            format!(
+                "✓ Created: {}, Updated: {}, Errors: {}",
+                stats.created, stats.updated, stats.errors
+            )
+            .green()
+        );
+    } else {
+        println!("{}", "✓ No changes to push".dimmed());
+    }
+
+    if stats.errors > 0 {
+        println!(
+            "{}",
+            format!("⚠️  {} tasks failed to sync", stats.errors).yellow()
+        );
+    }
+
+    Ok(())
+}
+
+fn sync_to_clickup(config: &Config) -> Result<()> {
+    // Check if ClickUp is enabled
+    let clickup_config = match &config.clickup {
+        Some(cfg) if cfg.enabled => cfg,
+        Some(_) => {
+            println!("{}", "ℹ️  ClickUp sync disabled in config".yellow());
+            return Ok(());
+        }
+        None => {
+            println!("{}", "ℹ️  ClickUp not configured. Add 'clickup' section to config.json".yellow());
+            return Ok(());
+        }
+    };
+
+    println!("{}", "📤 Pushing tasks to ClickUp...".cyan());
+
+    // Get list mappings (or use single list_id for all tasks)
+    let list_mappings = if let Some(ref mappings) = clickup_config.list_mappings {
+        mappings.clone()
+    } else if let Some(ref list_id) = clickup_config.list_id {
+        // Single list mode: all tasks go to one ClickUp list
+        // We'll create a universal mapping by getting all Google list IDs from cache
+        let sync_manager = SyncManager::new()?;
+        let all_tasks = sync_manager.get_all_cached_tasks()?;
+        let mut map = std::collections::HashMap::new();
+        
+        // Map every Google list ID to the single ClickUp list
+        for task in all_tasks {
+            if !map.contains_key(&task.list_id) {
+                map.insert(task.list_id.clone(), list_id.clone());
+            }
+        }
+        
+        map
+    } else {
+        anyhow::bail!("ClickUp config must have either list_mappings or list_id");
+    };
+
+    // Create ClickUp client
+    let client = ClickUpClient::new(clickup::ClickUpConfig {
+        api_token: clickup_config.api_token.clone(),
+        list_id: clickup_config.list_id.clone().unwrap_or_default(),  // Not used anymore
+    })?;
+
+    // Create sync manager
+    let sync_manager = SyncManager::new()?;
+    let clickup_sync = ClickUpSync::new(sync_manager, client, list_mappings);
+
+    // Push to ClickUp
+    let stats = clickup_sync.push_to_clickup()?;
+
+    if stats.created > 0 || stats.updated > 0 {
+        println!(
+            "{}",
+            format!(
+                "✓ Created: {}, Updated: {}, Errors: {}",
+                stats.created, stats.updated, stats.errors
+            )
+            .green()
+        );
+    } else {
+        println!("{}", "✓ No changes to push".dimmed());
+    }
+
+    if stats.errors > 0 {
+        println!(
+            "{}",
+            format!("⚠️  {} tasks failed to sync", stats.errors).yellow()
+        );
+    }
+
     Ok(())
 }
 
@@ -777,10 +955,11 @@ fn update_task_in_google(account: &str, task: &Task) -> Result<()> {
     let sync_manager = SyncManager::new()?;
     let existing = sync_manager.get_task_by_id(task_id)?;
     let existing_links = existing.as_ref().and_then(|t| t.links.clone());
-    let existing_created = existing.and_then(|t| t.created);
+    let existing_created = existing.as_ref().and_then(|t| t.created.clone());
 
     let cached = CachedTask {
         id: task_id.clone(),
+        unique_id: existing.as_ref().map(|t| t.unique_id.clone()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         list_id: list_id.clone(),
         title: formatted_title,
         status: "needsAction".to_string(),
@@ -788,6 +967,16 @@ fn update_task_in_google(account: &str, task: &Task) -> Result<()> {
         created: existing_created,
         links: existing_links,
         dirty: false, // Just pushed to Google, so not dirty
+        priority: existing.as_ref().and_then(|t| t.priority.clone()),
+        project: existing.as_ref().and_then(|t| t.project.clone()),
+        context: existing.as_ref().and_then(|t| t.context.clone()),
+        duration: existing.as_ref().and_then(|t| t.duration.clone()),
+        due_date: existing.as_ref().and_then(|t| t.due_date.clone()),
+        start_date: existing.as_ref().and_then(|t| t.start_date.clone()),
+        scheduled_date: existing.as_ref().and_then(|t| t.scheduled_date.clone()),
+        tags: existing.as_ref().and_then(|t| t.tags.clone()),
+        user_description: existing.as_ref().and_then(|t| t.user_description.clone()),
+        taskgarden_description: String::new(), // Will be regenerated
     };
     sync_manager.upsert_task(&cached)?;
 
@@ -806,13 +995,14 @@ fn update_task_locally(task: &Task) -> Result<()> {
 
     let sync_manager = SyncManager::new()?;
 
-    // Preserve existing links and created date from cache
+    // Preserve existing properties from cache
     let existing = sync_manager.get_task_by_id(task_id)?;
     let existing_links = existing.as_ref().and_then(|t| t.links.clone());
-    let existing_created = existing.and_then(|t| t.created);
+    let existing_created = existing.as_ref().and_then(|t| t.created.clone());
 
     let cached = CachedTask {
         id: task_id.clone(),
+        unique_id: existing.as_ref().map(|t| t.unique_id.clone()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         list_id: list_id.clone(),
         title: formatted_title,
         status: "needsAction".to_string(),
@@ -820,6 +1010,16 @@ fn update_task_locally(task: &Task) -> Result<()> {
         created: existing_created,
         links: existing_links,
         dirty: true, // Mark for later push
+        priority: existing.as_ref().and_then(|t| t.priority.clone()),
+        project: existing.as_ref().and_then(|t| t.project.clone()),
+        context: existing.as_ref().and_then(|t| t.context.clone()),
+        duration: existing.as_ref().and_then(|t| t.duration.clone()),
+        due_date: existing.as_ref().and_then(|t| t.due_date.clone()),
+        start_date: existing.as_ref().and_then(|t| t.start_date.clone()),
+        scheduled_date: existing.as_ref().and_then(|t| t.scheduled_date.clone()),
+        tags: existing.as_ref().and_then(|t| t.tags.clone()),
+        user_description: existing.as_ref().and_then(|t| t.user_description.clone()),
+        taskgarden_description: String::new(), // Will be regenerated
     };
     sync_manager.upsert_task_locally(&cached)?;
 
@@ -2489,7 +2689,7 @@ fn cmd_list(config: &Config, all: bool, sort: &str, reverse: bool, status_filter
 fn cmd_add(config: &Config, title: String, priority: Option<String>, project: Option<String>) -> Result<()> {
     // Extract hashtags from title
     let hashtag_regex = Regex::new(r"#(\w+)").unwrap();
-    let tags: Vec<String> = hashtag_regex
+    let mut tags: Vec<String> = hashtag_regex
         .captures_iter(&title)
         .map(|cap| cap.get(1).unwrap().as_str().to_string())
         .collect();
@@ -2498,23 +2698,78 @@ fn cmd_add(config: &Config, title: String, priority: Option<String>, project: Op
         id: None,
         list_id: None,
         date: Local::now().format(&config.date_format).to_string(),
-        priority,
-        project,
+        priority: priority.clone(),
+        project: project.clone(),
         status: None,
         context: None,
         time: None,
         title: title.clone(),
         list: "My Tasks".to_string(), // Default list
         attachment_type: None,
-        tags,
+        tags: tags.clone(),
     };
 
     let formatted_title = task.format(config);
 
-    println!("Adding task: {}", formatted_title);
+    println!("Adding task: {}", formatted_title.cyan());
 
-    // TODO: Add via gog CLI
-    println!("(Manual step: add this to Google Tasks)");
+    // Check if ClickUp is configured with a default list
+    if let Some(ref clickup_config) = config.clickup {
+        if clickup_config.enabled {
+            if let Some(ref default_list_id) = clickup_config.list_id {
+                println!("{}", "📤 Adding directly to ClickUp...".dimmed());
+                
+                // Create ClickUp client
+                let client = ClickUpClient::new(clickup::ClickUpConfig {
+                    api_token: clickup_config.api_token.clone(),
+                    list_id: default_list_id.clone(),
+                })?;
+                
+                // Add project as tag if present
+                if let Some(ref proj) = project {
+                    tags.push(proj.clone());
+                }
+                
+                // Map priority to ClickUp priority
+                let clickup_priority = match priority.as_deref() {
+                    Some("P0") => Some(1u8),
+                    Some("P1") => Some(2u8),
+                    Some("P2") => Some(3u8),
+                    Some("P3") | Some("P5") => Some(4u8),
+                    _ => None,
+                };
+                
+                // Create task in ClickUp
+                let clickup_task = clickup::ClickUpTask {
+                    id: None,
+                    name: title.clone(),
+                    description: None,
+                    status: Some("to do".to_string()),
+                    priority: clickup_priority,
+                    due_date: None,
+                    start_date: None,
+                    time_estimate: None,
+                    tags,
+                    assignees: vec![],
+                    custom_fields: None,
+                };
+                
+                match client.create_task(default_list_id, &clickup_task) {
+                    Ok(response) => {
+                        println!("{}", format!("✓ Created in ClickUp: {}", response.id).green());
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        eprintln!("{}", format!("⚠️  Failed to create in ClickUp: {}", e).yellow());
+                        println!("{}", "Falling back to manual Google Tasks entry...".dimmed());
+                    }
+                }
+            }
+        }
+    }
+    
+    // Fallback: print instructions for Google Tasks
+    println!("{}", "(Add this to Google Tasks manually)".dimmed());
 
     Ok(())
 }
@@ -3211,10 +3466,20 @@ fn main() -> Result<()> {
 
     // Auto-sync before most commands (unless it's an explicit sync command)
     match &cli.command {
-        Commands::Sync { force } => {
+        Commands::Sync { force, airtable, clickup } => {
             // Always sync when explicitly called
             sync_with_google(&config.google_account, *force)?;
             update_last_query()?;
+            
+            // Push to Airtable if requested
+            if *airtable {
+                sync_to_airtable(&config)?;
+            }
+            
+            // Push to ClickUp if requested
+            if *clickup {
+                sync_to_clickup(&config)?;
+            }
         }
         Commands::Triage { .. } | Commands::Focus | Commands::Plan | Commands::Schedule { .. } | Commands::List { .. } | Commands::Merge { .. } | Commands::Show { .. } | Commands::Search { .. } | Commands::Bump { .. } | Commands::Summary { .. } => {
             // Smart sync (check throttle)
@@ -3242,7 +3507,7 @@ fn main() -> Result<()> {
             cmd_search(&config, &query, project.as_deref(), status.as_deref(), context.as_deref(), priority.as_deref())?
         }
         Commands::Bump { days, week } => cmd_bump(&config, days, week)?,
-        Commands::Sync { force: _ } => {
+        Commands::Sync { force: _, airtable: _, clickup: _ } => {
             // Already handled above
             println!("{}", "✓ Sync complete!".green());
         }
